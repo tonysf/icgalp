@@ -1,3 +1,7 @@
+#The contents of this file make up the functions used to generate the plots
+#for the paper Inexact and Stochastic Generalized Conditional Gradient with 
+#Augmented Lagrangian and Proximal Step by Silveti-Falls, Molinari, and Fadili
+
 import numpy as np
 import scipy.spatial as spat
 import scipy.sparse as sp
@@ -8,9 +12,8 @@ import sympy as spy
 import progressbar as pb
 
 #gradient for a batch sample of nabla E
-def calc_bgradE(x, mu, y, A, Rho, lucky_indices):
+def calc_bgradE(x, mu, y, A, Ah, Rho, lucky_indices):
 	v = np.zeros(x.shape)
-	Ah = A.transpose()
 	Ahmu = Ah.dot(mu)
 	AhAx = Rho * Ah.dot(A.dot(x))
 	#compute the grad for the lucky batch
@@ -23,6 +26,20 @@ def calc_gradL(x, y, lucky_index):
 	v = np.zeros(x.shape)
 	#compute grad for lucky index
 	v[lucky_index] = x[lucky_index] - y[lucky_index]
+	return v
+
+def calc_gradLQ(x, y, lucky_index, A, Ah, Rho):
+	v = np.zeros(x.shape)
+	#compute grad for lucky index
+	v[lucky_index] = x[lucky_index] - y[lucky_index] + Rho * Ah.dot(A.dot(x))[lucky_index]
+	return v
+	
+def calc_bgradLQ(x, y, lucky_indices, A, Ah, Rho):
+	v = np.zeros(x.shape)
+	AhAx = Rho * Ah.dot(A.dot(x))
+	#compute the grad for the lucky batch
+	for l in lucky_indices:
+		v[l] = x[l] - y[l] + AhAx[l]
 	return v
 
 #gradient for a batch sample of nabla f
@@ -38,8 +55,7 @@ def calc_vrgrad(oldgrad, newgrad, stochweight):
 	return (1 - stochweight) * oldgrad + stochweight * newgrad
 
 #gradient terms coming from augmented lagrangian (not f)
-def calc_rest(x, mu, A, Rho):
-	Ah = A.transpose()
+def calc_rest(x, mu, A, Ah, Rho):
 	return Ah.dot(mu) + (Rho * Ah.dot(A.dot(x)))
 
 #this function solves the linear minimization oracle over the delta l1 ball
@@ -70,6 +86,7 @@ def cgalp(y, A, delta, b, a, Rho, itera, xstar):
 	feas = np.zeros(itera)
 	dist = np.zeros(itera)
 	Gamma = 0
+	Ah = A.transpose()
 	for i in pb.progressbar(range(itera - 1)):
 		#the stepsize gamma_k = (log(k+2)^a)/((k+1)^(1-b))
 		stepsize = (np.log(2 + i) ** a)/((1+i) ** (1 - b))
@@ -79,12 +96,94 @@ def cgalp(y, A, delta, b, a, Rho, itera, xstar):
 		feas[i] = np.linalg.norm(A.dot(erg)) ** 2
 		dist[i] = np.linalg.norm(erg - xstar) ** 2
 		#compute the gradient
-		grad = (x - y)/float(x.shape[0]) + calc_rest(x, mu, A, Rho)
+		grad = (x - y)/float(x.shape[0]) + calc_rest(x, mu, A, Ah, Rho)
 		#update primal and dual variables
 		x = primal_step(x, grad, stepsize, delta)
 		mu = dual_step(x, mu, stepsize, A)
 		#update sum of gammas for cesaro average
 		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
+	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
+	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
+	return x, mu, erg, feas, dist
+
+#icgalp with random sweeping on gradf_i
+def icgalp_rswf(y, A, batchsize, delta, b, a, Rho, itera, xstar):
+	n = y.shape[0]
+	x = np.zeros(y.shape)
+	erg = np.zeros(y.shape)
+	mu = np.zeros(A.shape[0])
+	feas = np.zeros(itera)
+	dist = np.zeros(itera)
+	Gamma = 0
+	Ah = A.transpose()
+	#initialize the gradient
+	#old
+	#grad = (x - y)/float(n)
+	grad = np.zeros(y.shape)
+	for i in pb.progressbar(range(itera - 1)):
+		#the stepsize gamma_k = (log(k+2)^a)/((k+1)^(1-b))
+		stepsize = (np.log(2 + i) ** a)/((1+i) ** (1 - b))
+		#the ergodic variable is the cesaro average w.r.t gamma_k
+		erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
+		#record the feasibility and optimality for ergodic variable
+		feas[i] = np.linalg.norm(A.dot(erg)) ** 2
+		dist[i] = np.linalg.norm(erg - xstar) ** 2
+		#calculate the current index to be updated
+		l = np.random.choice(n, batchsize, replace=False)
+		#replace the lucky_index'th component with a newly calculated grad
+		grad[l] = (x[l] - y[l])/float(n)
+		#calculate the remaining grad terms from aug lagrangian
+		restgrad = calc_rest(x, mu, A, Ah, Rho)
+		fullgrad = grad + restgrad
+		#update primal and dual variabels
+		x = primal_step(x, fullgrad, stepsize, delta)
+		mu = dual_step(x, mu, stepsize, A)
+		#update sum of gammas for cesaro averaging
+		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
+	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
+	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
+	return x, mu, erg, feas, dist
+
+#icgalp with random sweeping on gradf_i and quadratic term
+def icgalp_rswfQ(y, A, batchsize, delta, b, a, Rho, itera, xstar):
+	n = y.shape[0]
+	x = np.zeros(y.shape)
+	erg = np.zeros(y.shape)
+	mu = np.zeros(A.shape[0])
+	feas = np.zeros(itera)
+	dist = np.zeros(itera)
+	Gamma = 0
+	Ah = A.transpose()
+	#initialize the full gradient of f at x0
+	#old
+	#grad = (x - y)/float(n)
+	grad = np.zeros(y.shape)
+	for i in pb.progressbar(range(itera - 1)):
+		#the stepsize gamma_k = (log(k+2)^a)/((k+1)^(1-b))
+		stepsize = (np.log(2 + i) ** a)/((1+i) ** (1 - b))
+		#the ergodic variable is the cesaro average w.r.t gamma_k
+		erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
+		#record the feasibility and optimality for ergodic variable
+		feas[i] = np.linalg.norm(A.dot(erg)) ** 2
+		dist[i] = np.linalg.norm(erg - xstar) ** 2
+		#calculate the current index to be updated
+		l = np.random.choice(n, batchsize, replace=False)
+		#replace the lucky_index'th component with a newly calculated grad
+		grad[l] = (x[l] - y[l])/float(n) + Rho * Ah.dot(A.dot(x))[l]
+		#calculate the remaining grad terms from aug lagrangian
+		restgrad = Ah.dot(mu)
+		fullgrad = grad + restgrad
+		#update primal and dual variables
+		x = primal_step(x, fullgrad, stepsize, delta)
+		mu = dual_step(x, mu, stepsize, A)
+		#update sum of gammas for cesaro averaging
+		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
 	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
 	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
 	return x, mu, erg, feas, dist
@@ -98,8 +197,11 @@ def icgalp_swf(y, A, delta, b, a, Rho, itera, xstar):
 	feas = np.zeros(itera)
 	dist = np.zeros(itera)
 	Gamma = 0
-	#initialize the full gradient of f at x0
-	grad = (x - y)/float(n)
+	Ah = A.transpose()
+	#initialize the gradient
+	#old
+	#grad = (x - y)/float(n)
+	grad = np.zeros(y.shape)
 	for i in pb.progressbar(range(itera - 1)):
 		#the stepsize gamma_k = (log(k+2)^a)/((k+1)^(1-b))
 		stepsize = (np.log(2 + i) ** a)/((1+i) ** (1 - b))
@@ -113,13 +215,55 @@ def icgalp_swf(y, A, delta, b, a, Rho, itera, xstar):
 		#replace the lucky_index'th component with a newly calculated grad
 		grad[l] = (x[l] - y[l])/float(n)
 		#calculate the remaining grad terms from aug lagrangian
-		restgrad = calc_rest(x, mu, A, Rho)
+		restgrad = calc_rest(x, mu, A, Ah, Rho)
 		fullgrad = grad + restgrad
 		#update primal and dual variabels
 		x = primal_step(x, fullgrad, stepsize, delta)
 		mu = dual_step(x, mu, stepsize, A)
 		#update sum of gammas for cesaro averaging
 		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
+	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
+	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
+	return x, mu, erg, feas, dist
+
+#icgalp with sweeping on gradf_i and quadratic term
+def icgalp_swfQ(y, A, delta, b, a, Rho, itera, xstar):
+	n = y.shape[0]
+	x = np.zeros(y.shape)
+	erg = np.zeros(y.shape)
+	mu = np.zeros(A.shape[0])
+	feas = np.zeros(itera)
+	dist = np.zeros(itera)
+	Gamma = 0
+	Ah = A.transpose()
+	#initialize the full gradient of f at x0
+	#old
+	#grad = (x - y)/float(n)
+	grad = np.zeros(y.shape)
+	for i in pb.progressbar(range(itera - 1)):
+		#the stepsize gamma_k = (log(k+2)^a)/((k+1)^(1-b))
+		stepsize = (np.log(2 + i) ** a)/((1+i) ** (1 - b))
+		#the ergodic variable is the cesaro average w.r.t gamma_k
+		erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
+		#record the feasibility and optimality for ergodic variable
+		feas[i] = np.linalg.norm(A.dot(erg)) ** 2
+		dist[i] = np.linalg.norm(erg - xstar) ** 2
+		#calculate the current index to be updated
+		l = i % n
+		#replace the lucky_index'th component with a newly calculated grad
+		grad[l] = (x[l] - y[l])/float(n) + Rho * Ah.dot(A.dot(x))[l]
+		#calculate the remaining grad terms from aug lagrangian
+		restgrad = Ah.dot(mu)
+		fullgrad = grad + restgrad
+		#update primal and dual variables
+		x = primal_step(x, fullgrad, stepsize, delta)
+		mu = dual_step(x, mu, stepsize, A)
+		#update sum of gammas for cesaro averaging
+		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
 	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
 	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
 	return x, mu, erg, feas, dist
@@ -133,6 +277,7 @@ def icgalp_vrf(y, A, delta, s, b, a, Rho, itera, xstar):
 	feas = np.zeros(itera)
 	dist = np.zeros(itera)
 	Gamma = 0
+	Ah = A.transpose()
 	#initialize grad as 0 for the recursion
 	vrgrad = np.zeros(n)
 	for i in pb.progressbar(range(itera - 1)):
@@ -149,7 +294,7 @@ def icgalp_vrf(y, A, delta, s, b, a, Rho, itera, xstar):
 		#do the variance reduction recursion
 		vrgrad = calc_vrgrad(vrgrad, newgrad, stochweight)
 		#compute the other grad terms of aug lagrangian
-		restgrad = calc_rest(x, mu, A, Rho)
+		restgrad = calc_rest(x, mu, A, Ah, Rho)
 		grad = vrgrad + restgrad
 		#update primal var
 		x = primal_step(x, grad, stepsize, delta)
@@ -157,6 +302,48 @@ def icgalp_vrf(y, A, delta, s, b, a, Rho, itera, xstar):
 		mu = dual_step(x, mu, stepsize, A)
 		#update sum of gammas
 		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
+	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
+	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
+	return x, mu, erg, feas, dist
+	
+#icgalp with sampling on gradf_i, quadratic term, and variance reduction
+def icgalp_vrfQ(y, A, delta, s, b, a, Rho, itera, xstar):
+	n = y.shape[0]
+	x = np.zeros(y.shape)
+	erg = np.zeros(y.shape)
+	mu = np.zeros(A.shape[0])
+	feas = np.zeros(itera)
+	dist = np.zeros(itera)
+	Gamma = 0
+	Ah = A.transpose()
+	#initialize grad as 0 for the recursion
+	vrgrad = np.zeros(n)
+	for i in pb.progressbar(range(itera - 1)):
+		#set the step size and the stochastic weight accordingly
+		stepsize = (np.log(2 + i) ** a)/((1+i) ** (1 - b))
+		stochweight = (np.log(2 + i) ** (a * s))/((1+i) ** (s * (1 - b)))
+		erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
+		feas[i] = np.linalg.norm(A.dot(erg)) ** 2
+		dist[i] = np.linalg.norm(erg - xstar) ** 2
+		#draw an index randomly
+		lucky_index = np.random.randint(n, size=1)[0]
+		#compute a gradient according to lucky index
+		newgrad = calc_gradLQ(x, y, lucky_index, A, Ah, Rho)
+		#do the variance reduction recursion
+		vrgrad = calc_vrgrad(vrgrad, newgrad, stochweight)
+		#compute the linear grad term of aug lagrangian
+		restgrad = Ah.dot(mu)
+		grad = vrgrad + restgrad
+		#update primal var
+		x = primal_step(x, grad, stepsize, delta)
+		#update dual var
+		mu = dual_step(x, mu, stepsize, A)
+		#update sum of gammas
+		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
 	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
 	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
 	return x, mu, erg, feas, dist
@@ -170,6 +357,7 @@ def icgalp_vrfb(y, A, batchsize, delta, s, b, a, Rho, itera, xstar):
 	feas = np.zeros(itera)
 	dist = np.zeros(itera)
 	Gamma = 0
+	Ah = A.transpose()
 	#initialize the gradient as 0 for the recursion
 	vrgrad = np.zeros(n)
 	for i in pb.progressbar(range(itera - 1)):
@@ -186,7 +374,7 @@ def icgalp_vrfb(y, A, batchsize, delta, s, b, a, Rho, itera, xstar):
 		#do the variance reduction recursion
 		vrgrad = calc_vrgrad(vrgrad, newgrad, stochweight)
 		#compute the other grad terms of aug lagrangian
-		restgrad = calc_rest(x, mu, A, Rho)
+		restgrad = calc_rest(x, mu, A, Ah, Rho)
 		grad = vrgrad + restgrad
 		#update primal var
 		x = primal_step(x, grad, stepsize, delta)
@@ -194,6 +382,48 @@ def icgalp_vrfb(y, A, batchsize, delta, s, b, a, Rho, itera, xstar):
 		mu = dual_step(x, mu, stepsize, A)
 		#update sum of gammas
 		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
+	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
+	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
+	return x, mu, erg, feas, dist
+	
+#icgalp with batch sampling of gradf_i, quadratic term, and variance reduction
+def icgalp_vrfQb(y, A, batchsize, delta, s, b, a, Rho, itera, xstar):
+	n = y.shape[0]
+	x = np.zeros(y.shape)
+	erg = np.zeros(y.shape)
+	mu = np.zeros(A.shape[0])
+	feas = np.zeros(itera)
+	dist = np.zeros(itera)
+	Gamma = 0
+	Ah = A.transpose()
+	#initialize the gradient as 0 for the recursion
+	vrgrad = np.zeros(n)
+	for i in pb.progressbar(range(itera - 1)):
+		#set the step size and the stochastic weight accordingly
+		stepsize = (np.log(2 + i) ** a)/((1+i) ** (1 - b))
+		stochweight = (np.log(2 + i) ** (a * s))/((1+i) ** (s * (1 - b)))
+		erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
+		feas[i] = np.linalg.norm(A.dot(erg)) ** 2
+		dist[i] = np.linalg.norm(erg - xstar) ** 2
+		#draw a batch randomly
+		lucky_indices = np.random.choice(n, batchsize, replace=False)
+		#compute a gradient according to lucky index
+		newgrad = calc_bgradLQ(x, y, lucky_indices, A, Ah, Rho)
+		#do the variance reduction recursion
+		vrgrad = calc_vrgrad(vrgrad, newgrad, stochweight)
+		#compute the linear grad terms of aug lagrangian
+		restgrad = Ah.dot(mu)
+		grad = vrgrad + restgrad
+		#update primal var
+		x = primal_step(x, grad, stepsize, delta)
+		#update dual var
+		mu = dual_step(x, mu, stepsize, A)
+		#update sum of gammas
+		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
 	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
 	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
 	return x, mu, erg, feas, dist
@@ -207,6 +437,7 @@ def icgalp_vrb(y, A, batchsize, delta, s, b, a, Rho, itera, xstar):
 	feas = np.zeros(itera)
 	dist = np.zeros(itera)
 	Gamma = 0
+	Ah = A.transpose()
 	#initialize grad at 0 for recursion
 	vrgrad = np.zeros(n)
 	for i in pb.progressbar(range(itera - 1)):
@@ -218,7 +449,7 @@ def icgalp_vrb(y, A, batchsize, delta, s, b, a, Rho, itera, xstar):
 		dist[i] = np.linalg.norm(erg - xstar) ** 2
 		#draw a batch randomly
 		lucky_indices = np.random.choice(n, batchsize, replace=False)
-		newgrad = calc_bgradE(x, mu, y, A, Rho, lucky_indices)
+		newgrad = calc_bgradE(x, mu, y, A, Ah, Rho, lucky_indices)
 		#do the variance reduction recursion
 		vrgrad = calc_vrgrad(vrgrad, newgrad, stochweight)
 		#update primal var
@@ -227,6 +458,8 @@ def icgalp_vrb(y, A, batchsize, delta, s, b, a, Rho, itera, xstar):
 		mu = dual_step(x, mu, stepsize, A)
 		#update sum of gammas
 		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
 	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
 	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
 	return x, mu, erg, feas, dist
@@ -242,7 +475,9 @@ def icgalp_sw(y, A, delta, b, a, Rho, itera, xstar):
 	Gamma = 0
 	Ah = A.transpose()
 	#initialize the gradient of E at x0, mu0 (it's just nabla_x f(x0))
-	grad = (x - y)/float(n)
+	#old
+	#grad = (x - y)/float(n)
+	grad = np.zeros(y.shape)
 	for i in pb.progressbar(range(itera - 1)):
 		stepsize = (np.log(2 + i) ** a)/((1+i) ** (1 - b))
 		erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
@@ -256,6 +491,8 @@ def icgalp_sw(y, A, delta, b, a, Rho, itera, xstar):
 		x = primal_step(x, grad, stepsize, delta)
 		mu = dual_step(x, mu, stepsize, A)
 		Gamma += stepsize
+	stepsize = (np.log(1 + itera) ** a)/((itera) ** (1 - b))
+	erg = ((stepsize * x) + (Gamma * erg))/(Gamma + stepsize)
 	feas[itera - 1] = np.linalg.norm(A.dot(erg)) **2
 	dist[itera - 1] = np.linalg.norm(erg - xstar) ** 2
 	return x, mu, erg, feas, dist
